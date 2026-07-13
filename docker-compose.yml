@@ -1,0 +1,326 @@
+services:
+  broker-ingress:
+    image: dstacktee/dstack-ingress:2.2
+    ports:
+      - "443:443"
+    environment:
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      # TODO(deploy): domain must be provisioned (Cloudflare + this CVM) before
+      # first launch. compute-network-29 follows the dir-number convention; swap
+      # if a different host name is registered. Must match service.servingUrl.
+      - DOMAIN=compute-network-29.integratenetwork.work
+      - TARGET_ENDPOINT=http://0g-serving-provider-broker:3080
+      - CERTBOT_EMAIL=${CERTBOT_EMAIL}
+      - GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN}
+      - SET_CAA=true
+      - PORT=443
+      - TIMEOUT_CONNECT=10s
+      - TIMEOUT_SERVER=900s
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - cert-data:/etc/letsencrypt
+    restart: unless-stopped
+
+  # SIA inference server — 0GM-1.0-35B-A3B with Sparse Inference Alignment.
+  # Same base weights as 20-qwavity-35b, but a Reward Model (VM-Qwen3-4B)
+  # re-scores candidate tokens at every decode step → higher output quality,
+  # extra ITL cost. This is a SEPARATE service entry from 20-qwavity-35b, not a
+  # checkpoint rotation: register it as an independent model.
+  #
+  # Source of truth for the engine config (image, b2 inproc backend, RM args):
+  #   0gfoundation/0g-sparse-inference-alignment :: docker-compose.0gm35b.yml
+  # Differences from that file: build: dropped (CVM uses the prebuilt image),
+  # logging + network alias added, port unchanged.
+  #
+  # Model weights live on the host under /dstack/persistent/SIA/models/
+  #   - 0GM-1.0-35B-A3B-0427              (main LLM)
+  #   - VM-Qwen3-4B-merged-for-vllm       (reward model)
+  # mounted at /workspace/models inside the container.
+  #
+  # NOTE: SIA caps max_model_len at 32768 (vs 262144 on the noSIA SGLang
+  # deployment) — the RM context budget is the binding limit. Keep
+  # service.modelInfo.contextLength below in sync with --max_model_len.
+  sia-0gm35b:
+    image: sia-0gm35b:0.18.0
+    container_name: sia-0gm35b-server
+    restart: unless-stopped
+    init: true
+    ipc: host
+    shm_size: 16g
+    runtime: nvidia
+    environment:
+      # 主 LLM 用默认 FULL_AND_PIECEWISE cudagraph（不设 SIA_LLM_CUDAGRAPH）。
+      # RM 必须 eager（none）：0.18.0 RM 推理时遇到新 batch_descriptor 会尝试
+      # runtime capture，piecewise 会触发 RuntimeError。
+      SIA_RM_CUDAGRAPH: "none"
+      SIA_RM_MULTIPROCESS: "0"
+      NVIDIA_VISIBLE_DEVICES: "${NVIDIA_VISIBLE_DEVICES:-all}"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+    volumes:
+      - /dstack/persistent/SIA:/workspace
+      - vllm-compile-cache-0gm35b:/root/.cache/vllm
+    command: >
+      python src/sia_vllm_server.py
+        --llm        /workspace/models/0GM-1.0-35B-A3B-0427
+        --model_id   0GM-1.0-35B-A3B-0427-SIA
+        --rm_backend b2
+        --rm_model   /workspace/models/VM-Qwen3-4B-merged-for-vllm
+        --llm_gpu_mem    0.75
+        --rm_b2_gpu_mem  0.13
+        --topk 10 --weight 1.0 --entropy_threshold 1.0
+        --max_model_len 32768
+        --enable_prefix_caching
+        --mamba_cache_mode align
+        --host 0.0.0.0
+        --port 8000
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      # RM + LLM both load on boot; allow a long warmup before the broker is
+      # gated open (vLLM AOT cudagraph capture is included in this window).
+      start_period: 25m
+    stop_grace_period: 30s
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    logging:
+      driver: json-file
+      options:
+        max-size: 100m
+        max-file: "5"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      default:
+        aliases:
+          - sia
+          - sglang
+          - vllm
+
+  mysql:
+    image: mysql:8.0
+    ports:
+      - "33060:3306"
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=123456
+      - MYSQL_DATABASE=provider
+      - MYSQL_USER=provider
+      - MYSQL_PASSWORD=provider
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -uroot -p123456 -e 'USE provider'"]
+      interval: 15s
+      timeout: 5s
+      retries: 15
+      start_period: 60s
+    networks:
+      - default
+
+  # Main broker service
+  0g-serving-provider-broker:
+    image: ghcr.io/0gfoundation/0g-serving-broker:latest
+    ports:
+      - "80:3080"
+    environment:
+      - PORT=3080
+      - CONFIG_FILE=/etc/config.yaml
+      - NETWORK=phala
+    volumes:
+      - /dstack/user_config:/etc/config.yaml
+      - ./logs/broker:/var/log/inference
+      - ./logs/event:/var/log/event
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: 0g-inference-server
+    networks:
+      - default
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "test -L /proc/1/exe && readlink /proc/1/exe | grep -q broker",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      sia-0gm35b:
+        # Block broker from accepting traffic until SIA passes /health; there is
+        # no LiteLLM in the middle, so a not-ready engine would surface as 502s
+        # on /v1/messages.
+        condition: service_healthy
+
+  # Event service starts after broker is ready
+  0g-serving-provider-event:
+    image: ghcr.io/0gfoundation/0g-serving-broker:latest
+    environment:
+      - CONFIG_FILE=/etc/config.yaml
+    volumes:
+      - /dstack/user_config:/etc/config.yaml
+      - ./logs/event:/var/log/inference
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    command: 0g-inference-event
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q '0g-inference-event' /proc/1/cmdline"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    restart: unless-stopped
+    depends_on:
+      0g-serving-provider-broker:
+        condition: service_healthy
+
+  prometheus-init:
+    image: alpine:3.18
+    environment:
+      - PROMETHEUS_CONFIG=${PROMETHEUS_CONFIG:-}
+    volumes:
+      - prometheus-config:/tmp
+    command: |
+      sh -c 'if [ -n "$$PROMETHEUS_CONFIG" ]; then
+        echo "$$PROMETHEUS_CONFIG" | base64 -d > /tmp/prometheus.yml
+      else
+        cat > /tmp/prometheus.yml << "EOF"
+      global:
+        scrape_interval: 15s
+      scrape_configs:
+        - job_name: "0g-serving"
+          static_configs:
+            - targets: ["0g-serving-provider-broker:3080", "0g-serving-provider-event:3081"]
+        - job_name: "node-exporter"
+          static_configs:
+            - targets: ["prometheus-node-exporter:9100"]
+      EOF
+      fi'
+
+  prometheus:
+    image: prom/prometheus:v2.45.2
+    restart: unless-stopped
+    volumes:
+      - prometheus-config:/etc/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - default
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://localhost:9090/-/healthy",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      prometheus-init:
+        condition: service_completed_successfully
+
+  grafana:
+    image: grafana/grafana-oss:11.4.0
+    restart: unless-stopped
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "3003:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    networks:
+      - default
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -f http://localhost:3000/api/health || wget -q --spider http://localhost:3000/api/health",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    depends_on:
+      prometheus:
+        condition: service_healthy
+
+  prometheus-node-exporter:
+    image: prom/node-exporter:v1.7.0
+    restart: always
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - --collector.filesystem.ignored-mount-points
+      - "^/(sys|proc|dev|host|etc|rootfs/var/lib/docker/containers|rootfs/var/lib/docker/overlay2|rootfs/run/docker/netns|rootfs/var/lib/docker/aufs)($$|/)"
+    networks:
+      - default
+    privileged: true
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    expose:
+      - 9100
+
+  # NVIDIA GPU metrics exporter. Scraped by prometheus at dcgm-exporter:9400.
+  # Exposes GPU utilization, memory used, temperature, power, PCIe throughput.
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.5-3.4.0-ubuntu22.04
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - DCGM_EXPORTER_NO_HOSTNAME=1
+    cap_add:
+      - SYS_ADMIN
+    networks:
+      - default
+    expose:
+      - 9400
+    depends_on:
+      prometheus:
+        condition: service_healthy
+
+volumes:
+  mysql-data:
+  prometheus-config:
+  cert-data:
+  vllm-compile-cache-0gm35b:
+
+networks:
+  default:
+    name: 0g-serving-network
+    external: false
