@@ -1,0 +1,204 @@
+allowOrigins:
+  - "*"
+contractAddress: 0x47340d900bdFec2BD393c626E12ea0656F938d84
+database:
+  provider: root:123456@tcp(mysql:3306)/provider?parseTime=true
+event:
+  providerAddr: :8088
+interval:
+  autoSettleBufferTime: 60
+  forceSettlementProcessor: 7200
+  settlementProcessor: 3600
+revenueTransfer:
+  targetAddress: 0xf427f57a1c31ADe740427837Ea8B8b4BCeA3F3F8
+  reserveAmount: 10000000000000000000
+  interval: 3600
+service:
+  # TODO(deploy): per-deployment domain. compute-network-29 follows the
+  # dir-number convention; must match docker-compose broker-ingress DOMAIN and
+  # be provisioned before launch.
+  servingUrl: https://compute-network-29.integratenetwork.work
+  # Broker proxy.go strips "/v1/proxy" and an optional redundant "/v1" prefix
+  # before concatenating to targetUrl. The SIA server is OpenAI-compatible and
+  # listens on :8000; service name resolves on 0g-serving-network.
+  targetUrl: http://sia-0gm35b:8000/v1
+  # USD-denominated pricing — PriceUpdateProcessor converts these to wei using
+  # the live 0G/USD rate from priceFeed.sources below.
+  #
+  # TODO(pricing): these mirror 20-qwavity-35b (the noSIA entry). SIA does
+  # ~RM-rescoring per decode step, so realized throughput is 23–57% of noSIA
+  # (v3 sweep, see BENCHMARK.md — 55% at conc=1, 23% at the ~684 tok/s
+  # ceiling vs noSIA's ~2983). Cost-parity with noSIA therefore needs roughly
+  # a 4–5x uplift on output. The LLM team should set SIA-specific list
+  # prices; these values are a placeholder until then.
+  #   input  $0.032 / 1M tokens
+  #   output $0.192 / 1M tokens
+  #   cache  $0.01  / 1M tokens  (via cacheTokenBilling.divisor below)
+  priceDenomination: USD
+  inputPriceUSDPerMillionTokens: "0.032"
+  outputPriceUSDPerMillionTokens: "0.192"
+  type: chatbot
+  # Advertised / on-chain model id — stable across checkpoint rotations.
+  # Distinct from 20-qwavity-35b's 0GM-1.0-35B-A3B: this is a separate entry.
+  model: 0GM-1.0-35B-A3B-SIA
+  # Dated concrete id, kept callable so clients that hardcode it don't break;
+  # plus the lowercase form of the advertised id for case-insensitive clients.
+  modelAliases:
+    - 0GM-1.0-35B-A3B-0427-SIA
+    - 0gm-1.0-35b-a3b-sia
+    - 0gm-1.0-35b-a3b-0427-sia
+  # Rewritten into the outgoing request body before forwarding; must match the
+  # SIA server's --model_id (currently 0GM-1.0-35B-A3B-0427-SIA).
+  upstreamModel: 0GM-1.0-35B-A3B-0427-SIA
+  verifiability: TeeML
+  targetTeeAddress: ""
+  targetSeparated: false
+  verifierUrl: "https://github.com/Dstack-TEE/dstack/releases/tag/verifier-v0.5.5"
+  providerStake: 100000000000000000000
+  ownedBy: "0G Foundation"
+  modelInfo:
+    name: "0GM-1.0-35B-A3B-SIA"
+    description: "0GM-1.0-35B-A3B with Sparse Inference Alignment (SIA): a Reward Model re-scores candidate tokens at every decode step for higher output quality, at the cost of additional inter-token latency that grows with concurrency. Same base weights as 0GM-1.0-35B-A3B but a distinct service entry. Prefix caching is supported, and cached token usage is reported in usage.prompt_tokens_details.cached_tokens. Thinking/reasoning is enabled by default; to disable, set chat_template_kwargs: {enable_thinking: false}. Tool calls and response_format/structured-output are NOT supported — the SIA server returns 400 for requests carrying a tools field, since the Reward Model is not aligned for tool use."
+    # SIA caps the context at 32768 (--max_model_len) — the RM context budget is
+    # the binding limit, unlike the 262144 on the noSIA SGLang deployment.
+    contextLength: 32768
+    # Leaves ~24K of prompt room within the 32768 window.
+    maxCompletionTokens: 8192
+    architecture:
+      # SIA exposes a text->text decode path only. The Reward Model is not
+      # aligned for image-conditioned scoring, so image input is not advertised
+      # here even though the base weights are multimodal (same rationale as
+      # dropping tools below — don't advertise a path that 400s/degrades).
+      modality: text->text
+      inputModalities:
+        - text
+      outputModalities:
+        - text
+      instructType: "chatml"
+      tokenizer: "qwen"
+    # tools / tool_choice / response_format intentionally OMITTED: the SIA
+    # server returns 400 on a tools field (RM not aligned for tool use), and
+    # response_format is not honored by the SIA request model. Advertising them
+    # would make the upstream router send tool-call / structured-output traffic
+    # here and collect 400s.
+    supportedParameters:
+      - temperature
+      - top_p
+      - top_k
+      - max_tokens
+      - frequency_penalty
+      - presence_penalty
+      - stop
+      - chat_template_kwargs
+    supportedFormats:
+      - openai
+    defaultParameters:
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 20
+    teeType: "TDX"
+networks:
+  ethereum0g:
+    url: https://evmrpc.0g.ai
+    chainID: 16661
+    privateKeys:
+      # TODO(deploy): NEW per-provider signing key — must NOT reuse
+      # 20-qwavity-35b's. Same wallet as provider.key (this file = no 0x prefix,
+      # provider.key = 0x-prefixed). Generate a fresh key, fund it, register the
+      # provider on-chain, then fill both here and in provider.key.
+      - ${PRIVATE_KEY}
+    transactionLimit: 5000000
+    gasEstimationBuffer: 10000
+monitor:
+  enable: true
+  eventAddress: 0g-serving-provider-event:3081
+priceFeed:
+  sources:
+    - coingecko
+  updateInterval: 1h
+  minOnChainUpdateBps: 100
+  maxRateDeviationBps: 500
+  coinGeckoApiKey: "${COINGECKO_API_KEY}"
+  httpTimeout: 10s
+chatCacheExpiration: 20m
+cacheTokenBilling:
+  enabled: true
+  # Cache input is $0.01/M against $0.032/M input → ideal ratio 3.2; divisor is
+  # integer-only, so 3 is the closest match. Relies on the SIA server (vLLM
+  # --enable_prefix_caching) reporting usage.prompt_tokens_details.cached_tokens.
+  # Revisit alongside the SIA pricing TODO above.
+  divisor: 3
+nvGPU: true
+logger:
+  format: text
+  level: info
+  path: /var/log/inference/inference.log
+  rotationCount: 7
+logPaths:
+  brokerLogDir: /var/log/inference
+  eventLogDir: /var/log/event
+whitelist:
+  enabled: true
+  userAddresses:
+    - "0xBB3f5b0b5062CB5B3245222C5917afD1f6e13aF6"
+
+# Concurrency limits — tuned for the goal: serve as MANY concurrent users as
+# possible at a still-acceptable per-stream experience, while giving each user a
+# generous token budget. Sized from the v3 benchmark (2026-07, see
+# BENCHMARK.md) — the v2-based values (global 8 / per-user 2) are obsolete.
+#
+# Key SIA fact still holds, but the v3 build is much faster: aggregate output
+# throughput now plateaus at ~684 tok/s around conc=84 (v2: ~240 tok/s knee at
+# conc=8). Per-stream speed still collapses as the RM re-scores every decode
+# step:
+#   conc=16 → 23.8 tok/s/stream, ITL 42ms, TTFT p99 0.65s → good
+#   conc=24 → 18.9 tok/s/stream, ITL 53ms, TTFT p99 1.0s  → boundary acceptable
+#   conc=36 → 16.1 tok/s/stream, ITL 62ms                 → sluggish (the tier
+#                                                            v2 already rejected)
+# And past saturation the queue EXPLODES: conc=128 TTFT jumps to 10.3s mean /
+# 42s p99 (conc=84 was 1.5s mean). The global cap must sit far below ~84.
+#
+# Single-request ceiling: 32768 context (incl. 8192 max output).
+concurrencyLimit:
+  # Last v3 sweep point with acceptable per-stream experience (~19 tok/s, TTFT
+  # p99 1.0s, 432 tok/s aggregate ≈ 26K output TPM). The next point, conc=36,
+  # drops streams to 16 tok/s — the speed v2 rejected as sluggish. If the
+  # premium "quality tier" positioning wants snappier streams, drop to 16
+  # (23.8 tok/s per stream, at -16% aggregate throughput).
+  maxGlobalConcurrent: 24
+  # Deliberately LOW so slots spread across users (the "many users" goal): one
+  # user takes at most 4 of the 24 slots → ≥6 distinct users can run at once.
+  # Raising this would let one user monopolize the box and serve FEWER distinct
+  # users.
+  maxPerUserConcurrent: 4
+  # 4 slots × ~12 req/min best-case short-request churn (v3 bench req lat ≈ 5s
+  # at light load) ≈ 48 req/min — a non-throttling anti-abuse backstop.
+  perUserRPM: 48
+  perUserBurst: 12
+  # TPM counts input+output (incl. cache-read tokens — no cache discount on this
+  # limiter), post-consume. We want each user's budget as LARGE as possible
+  # without letting TPM throttle below what their concurrency slots physically
+  # allow. From the v2 input-length sweep: a single 32K-input stream churns
+  # 32738 tok × 0.25 req/s × 60 ≈ 491K token/min, so a user's 4 slots top out
+  # around 4 × 491K ≈ 1.96M token/min. (v3 did not re-sweep long context;
+  # prefill is SIA-independent and dominates 32K-input requests, so the v2
+  # estimate should still roughly hold — re-derive when v3 long-context data
+  # lands.)
+  #   - perUserTPM 2,000,000 ≈ that 4-slot physical ceiling. This is the MAX
+  #     useful per-user TPM at maxPerUserConcurrent=4: a user is slot-limited to
+  #     ~1.96M anyway, so going higher is inert, and going lower would throttle
+  #     them below their slots. Concurrency stays the real cap; TPM is the
+  #     anti-abuse backstop that only bites pathological rapid-fire large-context
+  #     flooding. (To grant a user a genuinely bigger budget you must raise their
+  #     slot count via perUserOverrides, which trades away the "many users" goal.)
+  #   - perUserTPMBurst 200,000 ≈ 6 full-context requests (bench req ≈ 32738 tok)
+  #     landing together. (Broker floors burst to contextLength=32768 anyway;
+  #     explicit value is just clearer.)
+  perUserTPM: 2000000
+  perUserTPMBurst: 200000
+  perUserIPM: 0
+  perUserIPMBurst: 0
+  # No partner-specific overrides on this entry (the NeoSeoul/test-wallet
+  # overrides on 20-qwavity-35b do not apply to the SIA service). Add here if a
+  # partner needs more headroom — bounded by maxGlobalConcurrent regardless.
+  perUserOverrides: []
